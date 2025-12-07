@@ -36,7 +36,12 @@ Modifications and additions for timm hacked together by / Copyright 2022, Ross W
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree (Attribution-NonCommercial 4.0 International (CC BY-NC 4.0))
 # No code was used directly from ConvNeXt-V2, however the weights are CC BY-NC 4.0 so beware if using commercially.
-
+import os
+import sys
+current_working_directory = os.getcwd()
+# print("Current working directory:", current_working_directory)
+sys.path.insert(0, current_working_directory)
+sys.path.append(current_working_directory)
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -46,9 +51,14 @@ import torch.nn as nn
 from timm.layers import trunc_normal_, AvgPool2dSame, DropPath, Mlp, GlobalResponseNormMlp, \
     LayerNorm2d, LayerNorm, create_conv2d, get_act_layer, make_divisible, to_ntuple
 from timm.layers import NormMlpClassifierHead, ClassifierHead
+import torchsummary
 
 from models.resnet import load_pretrained_weights
 from timm.models import named_apply
+from models.test import ema_attention, wave_attention
+
+from models.wtconv.wtconv2d import WTConv2d_v2
+from options import Options
 
 __all__ = ['ConvNeXt']  # model_registry will add each entrypoint fn to this
 
@@ -61,8 +71,10 @@ class Downsample(nn.Module):
         if stride > 1 or dilation > 1:
             avg_pool_fn = AvgPool2dSame if avg_stride == 1 and dilation > 1 else nn.AvgPool2d
             self.pool = avg_pool_fn(2, avg_stride, ceil_mode=True, count_include_pad=False)
+            print("pool!!!!!!")
         else:
             self.pool = nn.Identity()
+            print("no pool!!!!!!")
 
         if in_chs != out_chs:
             self.conv = create_conv2d(in_chs, out_chs, 1, stride=1)
@@ -73,6 +85,79 @@ class Downsample(nn.Module):
         x = self.pool(x)
         x = self.conv(x)
         return x
+
+
+# class ConvNeXtBlock2(nn.Module):
+#     def __init__(
+#             self,
+#             in_chs: int,
+#             out_chs: Optional[int] = None,
+#             # kernel_size: int = 7,
+#             kernel_size: int = 5,
+#             stride: int = 1,
+#             dilation: Union[int, Tuple[int, int]] = (1, 1),
+#             mlp_ratio: float = 4,
+#             conv_mlp: bool = False,
+#             conv_bias: bool = True,
+#             use_grn: bool = False,
+#             ls_init_value: Optional[float] = 1e-6,
+#             act_layer: Union[str, Callable] = 'gelu',
+#             norm_layer: Optional[Callable] = None,
+#             drop_path: float = 0.,
+#     ):
+#         super().__init__()
+#         out_chs = out_chs or in_chs
+#         dilation = to_ntuple(2)(dilation)
+#         act_layer = get_act_layer(act_layer)
+#         if not norm_layer:
+#             norm_layer = LayerNorm2d if conv_mlp else LayerNorm
+#         mlp_layer = partial(GlobalResponseNormMlp if use_grn else Mlp, use_conv=conv_mlp)
+#         self.use_conv_mlp = conv_mlp
+#         # self.conv_dw = create_conv2d(
+#         #     in_chs,
+#         #     out_chs,
+#         #     kernel_size=kernel_size,
+#         #     stride=stride,
+#         #     dilation=dilation[0],
+#         #     depthwise=True,
+#         #     bias=conv_bias,
+#         # )
+
+#         self.conv_dw = WTConv2d_v2(
+#             in_chs,
+#             out_chs,
+#             kernel_size=kernel_size,
+#             stride=stride,
+#             bias=conv_bias,
+#         )
+
+#         self.norm = norm_layer(out_chs)
+#         self.mlp = mlp_layer(out_chs, int(mlp_ratio * out_chs), act_layer=act_layer)
+#         self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs)) if ls_init_value is not None else None
+#         if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]:
+#             self.shortcut = Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0])
+#             print('?'*100)
+#             # self.shortcut = wave_attention.WaveAttention(in_chs, out_chs, stride=stride, dilation=dilation[0])
+#         else:
+#             self.shortcut = nn.Identity()
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+#     def forward(self, x):
+#         shortcut = x
+#         x = self.conv_dw(x)
+#         if self.use_conv_mlp:
+#             x = self.norm(x)
+#             x = self.mlp(x)
+#         else:
+#             x = x.permute(0, 2, 3, 1)
+#             x = self.norm(x)
+#             x = self.mlp(x)
+#             x = x.permute(0, 3, 1, 2)
+#         if self.gamma is not None:
+#             x = x.mul(self.gamma.reshape(1, -1, 1, 1))
+
+#         x = self.drop_path(x) + self.shortcut(shortcut)
+#         return x
 
 
 class ConvNeXtBlock(nn.Module):
@@ -90,7 +175,8 @@ class ConvNeXtBlock(nn.Module):
             self,
             in_chs: int,
             out_chs: Optional[int] = None,
-            kernel_size: int = 7,
+            # kernel_size: int = 7,
+            kernel_size: int = 5,
             stride: int = 1,
             dilation: Union[int, Tuple[int, int]] = (1, 1),
             mlp_ratio: float = 4,
@@ -127,20 +213,31 @@ class ConvNeXtBlock(nn.Module):
             norm_layer = LayerNorm2d if conv_mlp else LayerNorm
         mlp_layer = partial(GlobalResponseNormMlp if use_grn else Mlp, use_conv=conv_mlp)
         self.use_conv_mlp = conv_mlp
-        self.conv_dw = create_conv2d(
+        # self.conv_dw = create_conv2d(
+        #     in_chs,
+        #     out_chs,
+        #     kernel_size=kernel_size,
+        #     stride=stride,
+        #     dilation=dilation[0],
+        #     depthwise=True,
+        #     bias=conv_bias,
+        # )
+
+        self.conv_dw = WTConv2d_v2(
             in_chs,
             out_chs,
             kernel_size=kernel_size,
             stride=stride,
-            dilation=dilation[0],
-            depthwise=True,
             bias=conv_bias,
         )
+
         self.norm = norm_layer(out_chs)
         self.mlp = mlp_layer(out_chs, int(mlp_ratio * out_chs), act_layer=act_layer)
         self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs)) if ls_init_value is not None else None
         if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]:
             self.shortcut = Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0])
+            print('?'*100)
+            # self.shortcut = wave_attention.WaveAttention(in_chs, out_chs, stride=stride, dilation=dilation[0])
         else:
             self.shortcut = nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -169,7 +266,8 @@ class ConvNeXtStage(nn.Module):
             self,
             in_chs,
             out_chs,
-            kernel_size=7,
+            # kernel_size=7,
+            kernel_size=5,
             stride=2,
             depth=2,
             dilation=(1, 1),
@@ -183,7 +281,6 @@ class ConvNeXtStage(nn.Module):
             norm_layer_cl=None
     ):
         super().__init__()
-        self.grad_checkpointing = False
 
         if in_chs != out_chs or stride > 1 or dilation[0] != dilation[1]:
             ds_ks = 2 if stride > 1 or dilation[0] != dilation[1] else 1
@@ -199,6 +296,13 @@ class ConvNeXtStage(nn.Module):
                     padding=pad,
                     bias=conv_bias,
                 ),
+                # wave_attention.WaveAttention(
+                #     in_chs,
+                #     out_chs,
+                #     stride=stride,
+                #     dilation=dilation[0],
+                #     padding=pad,
+                # ),
             )
             in_chs = out_chs
         else:
@@ -220,8 +324,11 @@ class ConvNeXtStage(nn.Module):
                 act_layer=act_layer,
                 norm_layer=norm_layer if conv_mlp else norm_layer_cl,
             ))
+
             in_chs = out_chs
+        
         self.blocks = nn.Sequential(*stage_blocks)
+
 
     def forward(self, x):
         x = self.downsample(x)
@@ -243,6 +350,7 @@ class ConvNeXt(nn.Module):
             depths: Tuple[int, ...] = (3, 3, 9, 3),
             dims: Tuple[int, ...] = (96, 192, 384, 768),
             kernel_sizes: Union[int, Tuple[int, ...]] = 7,
+            # kernel_sizes: Union[int, Tuple[int, ...]] = 5,
             ls_init_value: Optional[float] = 1e-6,
             stem_type: str = 'patch',
             patch_size: int = 4,
@@ -378,26 +486,44 @@ class ConvNeXt(nn.Module):
                 act_layer='gelu',
             )
             self.head_hidden_size = self.head.num_features
+
+        # embed_dims= [96, 192, 384, 768]
+        
+        # for i in range(4):
+        #     wave_attn = wave_attention.WaveAttention(embed_dims[i])
+
+        #     setattr(self, f"wave_attn{i + 1}", wave_attn)
+
+        # self.wave_attn = wave_attention.WaveAttention(96)
+        
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
-
-
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
-        self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool)
 
 
     def forward_features(self, x):
         x = self.stem(x)
-        x = self.stages(x)
+        # x = self.stages(x)
+        res = []
+        for i in range(4):
+            x = self.stages[i](x)
+            # wave_attn = getattr(self, f"wave_attn{i + 1}")
+            # x = wave_attn(x)
+
+            # if i == 0:
+            #     x = self.wave_attn(x)
+            res.append(x)
+
         x = self.norm_pre(x)
-        return x
+        return x, res
+
 
     def forward_head(self, x, pre_logits: bool = False):
         return self.head(x, pre_logits=True) if pre_logits else self.head(x)
 
+
     def forward(self, x):
-        x = self.forward_features(x)
+        x, res = self.forward_features(x)
         x = self.forward_head(x)
+        # return x, res
         return x
 
 
@@ -414,7 +540,6 @@ def _init_weights(module, name=None, head_init_scale=1.0):
             module.bias.data.mul_(head_init_scale)
 
 
-
 def convnext_tiny(opt, **kwargs):
     model = ConvNeXt(depths=(3, 3, 9, 3), dims=(96, 192, 384, 768), num_classes=opt.num_classes, **kwargs)
     pretrained = opt.pretrained
@@ -423,12 +548,13 @@ def convnext_tiny(opt, **kwargs):
         pass
     else:
         if opt.pretrained == "miex":
-            if opt.input_type == "flow":
+            if opt.input_type in ["flow", "apex_flow", "three", "difference", "flow_diff"]:
                 # file = "/NAS/xiaohang/checkpoints/7_convnext_tiny_miex_flow_240530_193701.pth"
                 # file = "/NAS/xiaohang/checkpoints/7_convnext_tiny_miex_flow_240610_190618.pth"
                 file = "/NAS/xiaohang/checkpoints/7_convnext_tiny_miex_flow_240611_001220.pth"
-            elif opt.input_type == "apex":
-                file = "/NAS/xiaohang/checkpoints/8_convnext_tiny_miex_apex_240530_182951.pth"
+                # file = "/NAS/xiaohang/checkpoints/7_convnext_tiny_miex_flow_240704_210518.pth"
+        elif opt.input_type == "apex":
+            file = "/NAS/xiaohang/checkpoints/8_convnext_tiny_miex_apex_240530_182951.pth"
         elif opt.pretrained == "imagenet":
             file = "/NAS/xiaohang/checkpoints/convnext_tiny.in12k_ft_in1k.bin"
         else:
@@ -437,3 +563,50 @@ def convnext_tiny(opt, **kwargs):
         state_dict = torch.load(file, map_location=opt.device)
         load_pretrained_weights(model, state_dict)
     return model
+
+
+def convnext_small(opt, **kwargs):
+    model = ConvNeXt(depths=(3, 3, 27, 3), dims=(96, 192, 384, 768), num_classes=opt.num_classes, **kwargs)
+    pretrained = opt.pretrained
+    print(f'[!] initializing model with "{pretrained}" weights ...')
+    if opt.pretrained == "miex":
+        if opt.input_type in ["flow", "apex_flow"]:
+            pass
+    elif opt.pretrained == "imagenet":
+        file = "/NAS/xiaohang/checkpoints/convnext_small.in12k_ft_in1k.bin"
+    else:
+        raise NotImplementedError('wrong pretrained model!')
+
+    state_dict = torch.load(file, map_location=opt.device)
+    load_pretrained_weights(model, state_dict)
+    return model
+
+
+def convnext_base(opt, **kwargs):
+    model = ConvNeXt(depths=(3, 3, 27, 3), dims=(128, 256, 512, 1024), num_classes=opt.num_classes, **kwargs)
+    pretrained = opt.pretrained
+    print(f'[!] initializing model with "{pretrained}" weights ...')
+    if opt.pretrained == "miex":
+        if opt.input_type in ["flow", "apex_flow"]:
+            pass
+    elif opt.pretrained == "imagenet":
+        file = "/NAS/xiaohang/checkpoints/convnext_base.fb_in22k_ft_in1k.bin"
+    else:
+        raise NotImplementedError('wrong pretrained model!')
+
+    state_dict = torch.load(file, map_location=opt.device)
+    load_pretrained_weights(model, state_dict)
+    return model
+
+if __name__ == '__main__':
+    from thop import profile, clever_format
+    opt = Options().parse()
+    net = convnext_tiny(opt).cuda()
+    torchsummary.summary(net, (3, 224, 224))
+    print("="*100)
+    input = torch.randn(1, 3, 224, 224).cuda()
+    flops, params = profile(net, inputs=(input, ), verbose=False)
+    flops, params = clever_format([flops, params], "%.2f")
+    print("FLOPs:", flops)  # 单位为 GFLOPs
+    print("Params:", params)  # 单位为 M
+    print("="*100)
